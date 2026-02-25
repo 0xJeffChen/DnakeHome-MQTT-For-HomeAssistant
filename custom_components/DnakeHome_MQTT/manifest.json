@@ -2,10 +2,10 @@
   "domain": "dnake_home_mqtt",
   "name": "DnakeHome_Mqtt",
   "version": "1.0.0",
-  "documentation": "https://github.com/0xJeffChen/DnakeHome-MQTT-For-HomeAssiatant",
+  "documentation": "https://github.com/0xJeffChen/DnakeHome-MQTT-For-HomeAssistant",
   "config_flow": true,
   "dependencies": [],
-  "codeowners": ["@chenzf"],
+  "codeowners": ["@JeffChen"],
   "requirements": ["paho-mqtt>=2.1.0"],
   "iot_class": "local_push"
 }
