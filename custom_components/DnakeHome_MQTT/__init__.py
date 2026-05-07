@@ -1,6 +1,7 @@
 import logging
 import json
 import uuid
+import asyncio
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 from homeassistant.core import HomeAssistant
@@ -48,8 +49,13 @@ class DnakeMqttManager:
         self.display = entry.data[CONF_DISPLAY]
         self.account = entry.data[CONF_ACCOUNT]
 
+        self._connected = False
+        self._connected_event = asyncio.Event()
+        self._reconnect_lock = asyncio.Lock()
+
         # 绑定回调
         self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
         self.client.on_publish = self._on_publish
 
@@ -59,6 +65,7 @@ class DnakeMqttManager:
     async def async_init(self):
         """初始化连接"""
         try:
+            self.client.reconnect_delay_set(min_delay=1, max_delay=60)
             self.client.loop_start()
             await self.hass.async_add_executor_job(
                 self.client.connect,
@@ -67,7 +74,9 @@ class DnakeMqttManager:
                 60
             )
 
-            # --- 新增：启动每分钟一次的定时任务 ---
+            await self._wait_until_connected(timeout=10)
+
+            # --- 启动每分钟一次的定时任务 ---
             self._remove_heartbeat = async_track_time_interval(
                 self.hass,
                 self._async_heartbeat_callback,
@@ -79,6 +88,51 @@ class DnakeMqttManager:
         except Exception as e:
             _LOGGER.error("❌ 无法启动 MQTT 客户端: %s", e)
             return False
+
+    async def _wait_until_connected(self, timeout: float):
+        if self._connected:
+            return
+        try:
+            await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("⚠️ MQTT 在 %ss 内未确认连接成功，后续发送将触发自动重连", timeout)
+
+    def _set_connected_state(self, connected: bool):
+        self._connected = connected
+        if connected:
+            self._connected_event.set()
+        else:
+            self._connected_event.clear()
+
+    async def _ensure_connected(self) -> bool:
+        if self._connected:
+            return True
+
+        async with self._reconnect_lock:
+            if self._connected:
+                return True
+
+            self._connected_event.clear()
+            try:
+                await self.hass.async_add_executor_job(self.client.reconnect)
+            except Exception:
+                try:
+                    await self.hass.async_add_executor_job(
+                        self.client.connect,
+                        self.mqtt_url,
+                        self.mqtt_port,
+                        60
+                    )
+                except Exception as e:
+                    _LOGGER.error("❌ MQTT 重连失败: %s", e)
+                    return False
+
+            try:
+                await asyncio.wait_for(self._connected_event.wait(), timeout=10)
+                return True
+            except asyncio.TimeoutError:
+                _LOGGER.error("❌ MQTT 重连超时，仍未连接到 Broker")
+                return False
 
     async def _async_heartbeat_callback(self, _now):
         """定时任务回调函数"""
@@ -119,6 +173,9 @@ class DnakeMqttManager:
     async def async_clear(self):
         """断开连接"""
         _LOGGER.info("正在停止 MQTT 客户端...")
+        if self._remove_heartbeat is not None:
+            self._remove_heartbeat()
+            self._remove_heartbeat = None
         await self.hass.async_add_executor_job(self.client.loop_stop)
         await self.hass.async_add_executor_job(self.client.disconnect)
         return True
@@ -127,6 +184,9 @@ class DnakeMqttManager:
         """通用发送接口"""
         _LOGGER.info("🚀 准备下发 MQTT: 主题=%s, 内容=%s", topic, payload)
         try:
+            if not await self._ensure_connected():
+                _LOGGER.error("❌ 消息推送失败，MQTT 未连接")
+                return False
             result = await self.hass.async_add_executor_job(
                 self.client.publish, topic, payload.encode('utf-8'), qos, retain
             )
@@ -146,8 +206,14 @@ class DnakeMqttManager:
             _LOGGER.info("已订阅 Topic: %s", self.pub_topic)
             client.subscribe(self.sub_topic)
             _LOGGER.info("已订阅 Topic: %s", self.sub_topic)
+            self.hass.loop.call_soon_threadsafe(self._set_connected_state, True)
         else:
             _LOGGER.error("❌ ERROR: 连接失败，原因码: %s", rc)
+            self.hass.loop.call_soon_threadsafe(self._set_connected_state, False)
+
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
+        _LOGGER.warning("🔌 MQTT 已断开连接: reason=%s flags=%s", reason_code, disconnect_flags)
+        self.hass.loop.call_soon_threadsafe(self._set_connected_state, False)
 
     def _on_message(self, client, userdata, msg):
 
@@ -196,6 +262,7 @@ class DnakeMqttManager:
                             {
                                 "platform": DEVICE_TYPE_MAP[dtype]["platform"],
                                 "devNo": int(dno),
+                                "devType": int(dtype),
                                 "type": dtype,
                                 "name": f"Dnake_{DEVICE_TYPE_MAP[dtype]['name']}_{dno}"
                             }
